@@ -1,0 +1,5 @@
+# Risques acceptés en TP (émulateur local, pas de KMS) :
+# SSE-S3 (AES256) au lieu d'une clé KMS client sur les buckets
+AWS-0132
+# Chiffrement SQS géré par le service (sqs_managed_sse_enabled) au lieu d'une clé KMS
+AWS-0096
