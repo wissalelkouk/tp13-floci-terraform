@@ -1,0 +1,4 @@
+# Version de K3s épinglée (reproductibilité)
+k3s_version: "v1.36.5+k3s1"
+k3s_server_ip: "192.168.56.10"
+k3s_server_port: 6443

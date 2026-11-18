@@ -1,0 +1,11 @@
+- name: Installer K3s en mode agent (idempotent)
+  ansible.builtin.shell: curl -sfL https://get.k3s.io | sh -
+  args:
+    creates: /usr/local/bin/k3s
+  vars:
+    agent_ip: "{{ ansible_facts['all_ipv4_addresses'] | select('match', '^192[.]168[.]56[.]') | first }}"
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    K3S_URL: "https://{{ k3s_server_ip }}:{{ k3s_server_port }}"
+    K3S_TOKEN: "{{ hostvars['k3s-server'].k3s_token }}"
+    INSTALL_K3S_EXEC: "agent --node-ip {{ agent_ip }}"

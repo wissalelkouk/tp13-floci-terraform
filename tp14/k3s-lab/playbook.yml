@@ -1,0 +1,28 @@
+# TP14 partie 1 : cluster K3s, via le rôle "k3s".
+- name: Prérequis communs
+  hosts: all
+  become: true
+  tasks:
+    - name: Installer curl
+      ansible.builtin.apt:
+        name: curl
+        state: present
+        update_cache: true
+
+- name: Nœud server (control plane)
+  hosts: server
+  become: true
+  tasks:
+    - name: Appliquer le rôle k3s (server)
+      ansible.builtin.include_role:
+        name: k3s
+        tasks_from: server
+
+- name: Nœuds agents (workers)
+  hosts: agents
+  become: true
+  tasks:
+    - name: Appliquer le rôle k3s (agent)
+      ansible.builtin.include_role:
+        name: k3s
+        tasks_from: agent

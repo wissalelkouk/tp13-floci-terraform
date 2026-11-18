@@ -1,0 +1,38 @@
+# -*- mode: ruby -*-
+# TP14 : cluster K3s à deux nœuds (1 server + 1 agent), provisionné par Ansible.
+# vi: ft=ruby:ts=2:ai:sw=2
+
+NODES = [
+  { name: "k3s-server", ip: "192.168.56.10", cpus: 2, memory: 3072 },
+  { name: "k3s-agent",  ip: "192.168.56.11", cpus: 2, memory: 2048 },
+]
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-24.04"
+
+  NODES.each_with_index do |node, index|
+    config.vm.define node[:name] do |vm|
+      vm.vm.hostname = node[:name]
+      vm.vm.network "private_network", ip: node[:ip]
+      vm.vm.provider "virtualbox" do |vb|
+        vb.name   = node[:name]
+        vb.cpus   = node[:cpus]
+        vb.memory = node[:memory]
+      end
+
+      # Ansible n'est lancé qu'une fois, après la création de la DERNIÈRE VM,
+      # pour configurer tout le cluster en un seul passage (limit = "all").
+      if index == NODES.size - 1
+        vm.vm.provision "ansible" do |ansible|
+          ansible.playbook = "playbook.yml"
+          ansible.limit    = "all"
+          ansible.groups   = {
+            "server" => ["k3s-server"],
+            "agents" => ["k3s-agent"],
+          }
+          ansible.extra_vars = { k3s_server_ip: NODES[0][:ip] }
+        end
+      end
+    end
+  end
+end

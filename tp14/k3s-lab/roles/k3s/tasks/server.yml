@@ -1,0 +1,30 @@
+- name: Installer K3s en mode server (idempotent)
+  ansible.builtin.shell: curl -sfL https://get.k3s.io | sh -
+  args:
+    creates: /usr/local/bin/k3s
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: "server --node-ip {{ k3s_server_ip }} --tls-san {{ k3s_server_ip }} --write-kubeconfig-mode 644"
+
+- name: Lire le jeton du server
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: node_token
+
+- name: Stocker le jeton dans un fait pour le play des agents
+  ansible.builtin.set_fact:
+    k3s_token: "{{ node_token.content | b64decode | trim }}"
+
+- name: Rapatrier le kubeconfig sur la VM de lab
+  ansible.builtin.fetch:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: "{{ playbook_dir }}/k3s.yaml"
+    flat: true
+
+- name: Remplacer 127.0.0.1 par l'IP du server dans le kubeconfig
+  ansible.builtin.replace:
+    path: "{{ playbook_dir }}/k3s.yaml"
+    regexp: '127\.0\.0\.1'
+    replace: "{{ k3s_server_ip }}"
+  delegate_to: localhost
+  become: false

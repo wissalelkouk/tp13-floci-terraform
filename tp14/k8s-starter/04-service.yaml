@@ -1,0 +1,14 @@
+# TP14 partie 3 : Service ClusterIP devant les Pods whoami.
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: tp14
+spec:
+  type: ClusterIP
+  selector:
+    app: whoami
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

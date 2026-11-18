@@ -3,3 +3,9 @@
 *.tfstate.*
 tfplan
 *.bak
+
+k3s.yaml
+*.kubeconfig
+.kube/
+*.orig
+*.log

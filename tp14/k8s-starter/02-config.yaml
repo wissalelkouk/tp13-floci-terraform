@@ -1,0 +1,10 @@
+# TP14 partie 4 : configuration non sensible (ConfigMap).
+# Le Secret, lui, se crée en ligne de commande (voir TP.md) et n'est PAS versionné.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: whoami-config
+  namespace: tp14
+data:
+  WHOAMI_NAME: "tp14-v3"
+  LOG_LEVEL: "debug"

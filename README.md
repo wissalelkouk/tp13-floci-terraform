@@ -1,3 +1,5 @@
+> Ce dépôt regroupe deux TP : **TP13** (Floci, Terraform, OpenTofu) et **TP14** (K3s et Kubernetes, voir [TP14](#tp14--kubernetes-avec-k3s)).
+
 # TP13 : Cloud AWS local avec Floci et Terraform avancé
 
 **Environnement :** VM Ubuntu Server, Docker, Terraform v1.17.2, OpenTofu v1.13.9, provider `hashicorp/aws` v6.73.0, Node.js 24, AWS CLI v2
@@ -443,3 +445,348 @@ Résultat pour dev : `Destroy complete! Resources: 13 destroyed.` Le conteneur `
 | `state-lock-terminal1.png` | Terminal 1 : `apply` en attente de confirmation |
 | `iac-scan-code-retour-casse.png`, `iac-checkov-sain.png`, `iac-trivy-sain-aws0132.png` | Détails du scan IaC |
 | `opentofu-version.png` | `tofu version` : OpenTofu v1.13.9 |
+
+---
+
+# TP14 : Kubernetes avec K3s
+
+**Auteur :** Wissal
+**Dates :** 15 au 17 novembre 2026
+**Environnement :** Ubuntu Server 26.04, K3s v1.36.5+k3s1 (containerd 2.3.4), kubectl v1.37.2, Ansible core 2.20.1, Vagrant 2.4.9, noyau 7.0.0-43-generic
+
+---
+
+## Sommaire
+
+1. [Choix de l'environnement (plan B)](#1-choix-de-lenvironnement-plan-b)
+2. [Structure du rendu](#2-structure-du-rendu)
+3. [Partie 1 : cluster K3s avec Ansible](#3-partie-1--cluster-k3s-avec-ansible)
+4. [Partie 2 : Pods et Deployments](#4-partie-2--pods-et-deployments)
+5. [Partie 3 : Services et Ingress](#5-partie-3--services-et-ingress)
+6. [Partie 4 : ConfigMap et Secret](#6-partie-4--configmap-et-secret)
+7. [Partie 5 : santé, ressources, déploiements progressifs](#7-partie-5--santé-ressources-et-déploiements-progressifs)
+8. [Partie 6 : stockage persistant](#8-partie-6--stockage-persistant)
+9. [Partie 7 : HorizontalPodAutoscaler](#9-partie-7--horizontalpodautoscaler)
+10. [Défi](#10-défi)
+11. [Difficultés rencontrées](#11-difficultés-rencontrées)
+12. [Liste des captures](#12-liste-des-captures)
+
+---
+
+## 1. Choix de l'environnement (plan B)
+
+Le sujet prévoit un cluster à deux nœuds créé par Vagrant. Ce n'était pas possible sur ma VM de lab :
+
+| | Ma VM | Requis |
+|---|---|---|
+| vCPU | 4 | 4 |
+| RAM | 4,2 Gio | 8 Go |
+| VirtualBox | non installé | indispensable pour `vagrant up` |
+
+Les deux VM du `Vagrantfile` demandent 5 Go de RAM à elles seules. J'ai donc appliqué le **plan B** du sujet : K3s directement sur la VM de lab, en **nœud unique**.
+
+Un cluster K3s (v1.36.5+k3s1) existait déjà sur cette VM depuis 32 jours et héberge une autre application (`spring-app-deployment`, namespace `default`). Je ne l'ai pas désinstallé : le TP travaille dans son propre namespace `tp14`, sans conflit, et le playbook Ansible a été exécuté sur le cluster existant (il est idempotent). Les conséquences pour le rendu :
+
+- `cluster-nodes.png` montre un seul nœud ;
+- `rebuild.png` illustre l'**idempotence** du playbook (deuxième exécution, `changed=0`) à la place de `vagrant destroy -f && vagrant up` ;
+- la question « sur quels nœuds sont répartis les Pods ? » a pour réponse « un seul » ;
+- le Défi (troisième nœud, `drain`) n'est pas réalisable sur un nœud unique.
+
+Le nom `whoami.lab.local` pointe vers l'adresse de Traefik sur la VM (`172.28.79.32`) dans `/etc/hosts`, au lieu de `192.168.56.10` qui n'existe pas en nœud unique.
+
+---
+
+## 2. Structure du rendu
+
+Les fichiers du TP14 sont dans le dossier `tp14/` du dépôt, et ses captures dans `captures/tp14/` :
+
+```
+tp14/
+├── k3s-lab/
+│   ├── Vagrantfile
+│   ├── playbook.yml
+│   ├── inventory-local.ini
+│   └── roles/k3s/
+│       ├── defaults/main.yml
+│       └── tasks/{server,agent}.yml
+└── k8s-starter/
+    ├── 01-namespace.yaml
+    ├── 02-config.yaml
+    ├── 03-deployment.yaml
+    ├── 04-service.yaml
+    ├── 05-ingress.yaml
+    ├── 05b-api.yaml
+    ├── 06-postgres.yaml
+    └── 07-hpa.yaml
+captures/tp14/            (captures d'écran du TP14)
+```
+
+Aucun fichier `k3s.yaml` (kubeconfig) et aucun Secret ne sont dans le dépôt : les Secrets sont créés en ligne de commande.
+
+---
+
+## 3. Partie 1 : cluster K3s avec Ansible
+
+### 3.1 Architecture d'un cluster
+
+| Composant | Rôle |
+|---|---|
+| API server | Point d'entrée unique : `kubectl` et tous les composants lui parlent. |
+| Datastore | État du cluster (SQLite par défaut avec K3s, etcd en haute disponibilité). |
+| Scheduler | Choisit le nœud de chaque Pod selon les ressources demandées. |
+| Controllers | Boucles qui rapprochent l'état réel de l'état désiré (ReplicaSet, Deployment...). |
+| kubelet | Agent de chaque nœud : démarre les conteneurs via containerd. |
+
+### 3.2 Playbook
+
+Le `playbook.yml` complété installe K3s en mode server de façon idempotente (`creates: /usr/local/bin/k3s`, avec `--node-ip`, `--tls-san` et `--write-kubeconfig-mode 644`), lit le jeton du server (`slurp`) et le stocke dans un fait (`set_fact`), rapatrie `k3s.yaml` (`fetch`) puis remplace `127.0.0.1` par l'adresse du server. Le play des agents (`K3S_URL`, `K3S_TOKEN`) est écrit mais ignoré en nœud unique (`skipping: no hosts matched`).
+
+Comme `sudo` sur Ubuntu 26.04 gère mal l'invite de mot de passe d'Ansible (`Timed out waiting for become success`), j'ai lancé le playbook en root :
+
+```bash
+cd ~/k3s-lab
+time sudo ansible-playbook -i inventory-local.ini -e k3s_server_ip=127.0.0.1 playbook.yml
+```
+
+Première exécution : `ok=8 changed=1 failed=0` (seul changement : le rapatriement de `k3s.yaml`), en 38 s.
+
+![Cluster : nœud Ready, pods système, PLAY RECAP](captures/tp14/cluster-nodes.png)
+
+Le nœud `wissal` est `Ready` (control-plane), et `coredns`, `traefik`, `local-path-provisioner` et `metrics-server` tournent.
+
+### 3.3 Rôle `k3s`
+
+Le playbook a été transformé en rôle : `roles/k3s/tasks/server.yml`, `tasks/agent.yml` et `defaults/main.yml`, qui épingle la version avec `k3s_version: "v1.36.5+k3s1"` (variable `INSTALL_K3S_VERSION`). Le playbook appelle les deux fichiers par `include_role` avec `tasks_from`.
+
+Une remarque honnête : comme K3s était déjà installé, l'étape d'installation est ignorée, donc la version épinglée n'a pas été réellement exercée sur ce cluster.
+
+### 3.4 Reconstruction et idempotence
+
+Je n'ai pas détruit le cluster, car il héberge une autre application. J'ai donc démontré l'idempotence : après le passage au rôle, une nouvelle exécution du playbook donne `ok=9 changed=0 failed=0` (11 à 21 secondes), sans réinstaller K3s.
+
+![Deuxième exécution du playbook : changed=0](captures/tp14/rebuild.png)
+
+---
+
+## 4. Partie 2 : Pods et Deployments
+
+```bash
+kubectl run test --image=traefik/whoami:v1.10.0
+kubectl delete pod test
+kubectl apply -f k8s-starter/01-namespace.yaml -f k8s-starter/03-deployment.yaml
+```
+
+**Le Pod lancé à la main est-il recréé ?** Non. Un Pod créé avec `kubectl run` n'a aucun contrôleur au-dessus de lui : une fois supprimé, personne ne le remet en place.
+
+**Un Pod du Deployment est supprimé :** un nouveau Pod apparaît en 1 seconde, car le ReplicaSet maintient 2 réplicas. Le second Pod n'a pas bougé.
+
+**Sur quels nœuds sont répartis les Pods ?** Sur un seul nœud (`wissal`), puisque le cluster n'en a qu'un.
+
+**`kubectl exec -it ... -- sh`** échoue avec `exec: "sh": executable file not found in $PATH` : l'image `whoami` est minimale et ne contient pas de shell.
+
+**`kubectl explain deployment.spec.strategy.rollingUpdate` :** `maxSurge` et `maxUnavailable` valent 25 % par défaut (arrondis respectivement à 1 par excès et 0 par défaut avec 2 réplicas).
+
+`kubectl describe` montre dans `Events` : `Scheduled`, `Pulled`, `Created`, `Started`. Au départ, la classe de QoS est `BestEffort` (ni `requests` ni `limits`).
+
+---
+
+## 5. Partie 3 : Services et Ingress
+
+Le Service `whoami` (`ClusterIP`, port 80 vers le port nommé `http`) reçoit le `selector` `app: whoami`. L'Ingress `traefik` route `whoami.lab.local/` vers ce Service.
+
+Un second Service sert la route `/api` : `05b-api.yaml` contient une ConfigMap (`api-page`, qui apporte une page HTML), un Deployment `nginx:1.27-alpine` et le Service `api`. La règle `/api` est ajoutée à l'Ingress existant, dans le même fichier.
+
+```bash
+curl -s http://whoami.lab.local | head -4
+curl -sL http://whoami.lab.local/api/
+kubectl -n tp14 get svc,ingress
+```
+
+![Ingress : whoami et /api](captures/tp14/ingress.png)
+
+La capture montre la réponse de `whoami` (Hostname et IP du Pod), la page de `/api/` servie par nginx, les deux Services `ClusterIP` et l'Ingress `traefik` pour `whoami.lab.local`.
+
+| Type de Service | Accès |
+|---|---|
+| ClusterIP | Interne au cluster uniquement (par défaut). |
+| NodePort | Port 30000 à 32767 ouvert sur chaque nœud. |
+| LoadBalancer | IP externe (fournie par ServiceLB sur K3s, par le cloud ailleurs). |
+| Ingress | Routage HTTP par nom d'hôte et chemin vers des Services ClusterIP. |
+
+---
+
+## 6. Partie 4 : ConfigMap et Secret
+
+Le Secret est créé en ligne de commande (il n'est pas versionné) :
+
+```bash
+kubectl -n tp14 create secret generic whoami-secret --from-literal=api-key='lab-only-value'
+kubectl -n tp14 get secret whoami-secret -o yaml
+kubectl -n tp14 get secret whoami-secret -o jsonpath='{.data.api-key}' | base64 -d
+```
+
+La valeur apparaît en base64 (`bGFiLW9ubHktdmFsdWU=`) et `base64 -d` redonne immédiatement `lab-only-value`. **Base64 n'est pas du chiffrement** : la protection d'un Secret vient du contrôle d'accès (RBAC) et du chiffrement au repos du datastore.
+
+La ConfigMap `whoami-config` (clés `WHOAMI_NAME` et `LOG_LEVEL`, TODO complété) est injectée avec `envFrom`, et la clé `api-key` du Secret par `secretKeyRef` (variable `API_KEY`). La page `whoami` avec `?env=true` affiche `API_KEY=lab-only-value`.
+
+**La valeur change-t-elle dans les Pods existants après modification de la ConfigMap ?** Non. Test en une seule séquence (`WHOAMI_NAME` passe de `tp14-v2` à `tp14-v3`, et `LOG_LEVEL` de `info` à `debug`) :
+
+![ConfigMap : avant, modification, après apply, restart, après restart](captures/tp14/configmap-restart.png)
+
+| Étape | `Name` | `LOG_LEVEL` |
+|---|---|---|
+| 1. avant | `tp14-v2` | `info` |
+| 3. après `apply`, sans redémarrer | `tp14-v2` (inchangé) | `info` (inchangé) |
+| 5. après `kubectl rollout restart` | `tp14-v3` | `debug` |
+
+Les variables d'environnement sont lues au démarrage du conteneur : il faut `kubectl rollout restart deploy/whoami` pour les renouveler.
+
+---
+
+## 7. Partie 5 : santé, ressources et déploiements progressifs
+
+### 7.1 Probes et ressources
+
+Le Deployment reçoit une `readinessProbe` (HTTP `/health`, toutes les 3 s, 2 échecs) et une `livenessProbe` (HTTP `/health`, toutes les 5 s, 3 échecs), ainsi que `requests` (50m CPU, 32Mi) et `limits` (200m CPU, 64Mi). La classe de QoS passe à `Burstable`.
+
+![Probes, requests/limits et QoS Burstable](captures/tp14/probes-config.png)
+
+### 7.2 Panne simulée
+
+`whoami` permet de forcer le code de `/health` :
+
+```bash
+kubectl -n tp14 port-forward deploy/whoami 8081:8080 &
+curl -X POST -d '500' localhost:8081/health
+kubectl -n tp14 get pods -w
+```
+
+Séquence observée : le Pod passe à `0/1` (la `readinessProbe` échoue : il sort des endpoints du Service mais n'est pas tué), puis `RESTARTS` passe à `1` (la `livenessProbe` a échoué 3 fois, kubelet redémarre le conteneur), puis le Pod revient à `1/1`. Le second Pod a continué à servir.
+
+![Pod redémarré par la livenessProbe : Unhealthy et Killing](captures/tp14/probes-restart.png)
+
+Les `Events` indiquent `Readiness probe failed` (x6) et `Liveness probe failed` (x3) avec `statuscode: 500`, puis `Container whoami failed liveness probe, will be restarted`.
+
+### 7.3 Rolling update et rollback
+
+```bash
+kubectl -n tp14 set image deploy/whoami whoami=traefik/whoami:v1.10.1
+kubectl -n tp14 set image deploy/whoami whoami=traefik/whoami:v9.9.9   # image inexistante
+kubectl -n tp14 get pods
+kubectl -n tp14 rollout history deploy/whoami
+kubectl -n tp14 rollout undo deploy/whoami
+```
+
+![Image inexistante, historique et rollback](captures/tp14/rollout-undo.png)
+
+Le nouveau Pod est en `ImagePullBackOff` pendant que les deux anciens restent `Running`. `rollout undo` ramène l'image à `traefik/whoami:v1.10.1`. Une boucle de `curl` lancée pendant l'opération a reçu **35 réponses `200` sur 35** : aucune interruption.
+
+Une remarque sur l'historique : l'annotation `change-cause` `update vers v1.10.1` apparaît sur plusieurs révisions. Elle est copiée d'une révision à l'autre tant qu'on ne la met pas à jour.
+
+**Pourquoi le service n'a jamais été interrompu ?**
+
+- `maxSurge` (25 %, arrondi à 1 avec 2 réplicas) : Kubernetes crée **d'abord** un nouveau Pod avant d'en retirer un ancien.
+- `maxUnavailable` (25 %, arrondi à 0) : aucun ancien Pod ne peut être retiré tant qu'un nouveau n'est pas prêt.
+- La `readinessProbe` : un Pod n'entre dans les endpoints du Service que s'il est `Ready`. Le Pod en `ImagePullBackOff` ne l'est jamais, donc il ne reçoit aucun trafic et les anciens Pods ne sont pas supprimés. Le déploiement reste bloqué, mais le service continue de fonctionner.
+
+Le manifest `03-deployment.yaml` a été aligné sur l'image `v1.10.1` pour qu'un futur `kubectl apply` ne fasse pas redescendre la version.
+
+### 7.4 OOMKilled
+
+Avec `whoami`, les limites de **4 Mi** et **8 Mi** n'ont pas déclenché de `OOMKilled` : le Pod a démarré et est passé `Ready`, car ce binaire consomme très peu de mémoire. Le comportement a été démontré avec un Pod qui consomme volontairement de la mémoire (limite 16 Mi), qui a été tué :
+
+![Pod tué par manque de mémoire : OOMKilled, exit code 137](captures/tp14/oomkilled.png)
+
+`Reason: OOMKilled` et `Exit Code: 137` (128 + signal 9). Les valeurs d'origine ont été restaurées sur le Deployment (`limits` 200m / 64Mi, `requests` 50m / 32Mi).
+
+---
+
+## 8. Partie 6 : stockage persistant
+
+### 8.1 Déploiement
+
+Le Secret `postgres-secret` est créé en ligne de commande. Le montage du PVC `pgdata` (1 Gi, StorageClass `local-path`) est ajouté au Deployment `postgres` (`volumes` et `volumeMounts` sur `/var/lib/postgresql/data`). La stratégie `Recreate` est conservée : un volume `ReadWriteOnce` ne peut être monté que par un Pod à la fois. Le premier démarrage a pris 22 minutes à cause du téléchargement de l'image (connexion lente).
+
+### 8.2 Test de persistance
+
+```bash
+kubectl -n tp14 exec deploy/postgres -- psql -U postgres \
+  -c "CREATE TABLE IF NOT EXISTS visits(id serial PRIMARY KEY, page text);" \
+  -c "INSERT INTO visits(page) VALUES ('/home'),('/contact');" \
+  -c "SELECT * FROM visits;"
+kubectl -n tp14 delete pod -l app=postgres
+kubectl -n tp14 exec deploy/postgres -- psql -U postgres -c "SELECT * FROM visits;"
+```
+
+![La donnée survit à la suppression du Pod PostgreSQL](captures/tp14/pvc-persistence.png)
+
+Le Pod a changé de nom (`zr9b4` puis `nm7tq`), mais les deux lignes `/home` et `/contact` sont toujours présentes : la donnée est sur le volume, pas dans le conteneur.
+
+### 8.3 Où sont stockées les données ? Quelle limite ?
+
+![PV, PVC, chemin et affinité de nœud](captures/tp14/pv-stockage.png)
+
+- **Où ?** Dans un dossier du disque du nœud : `/var/lib/rancher/k3s/storage/pvc-9984b7bc-..._tp14_pgdata`. Ce n'est pas un stockage réseau.
+- **Quelle limite ?** Le PV porte une **affinité de nœud** (`kubernetes.io/hostname in [wissal]`) : si le Pod était replanifié sur un autre nœud, il resterait `Pending`, car le volume ne le suit pas. Il n'y a ni réplication ni sauvegarde. Sur un nœud unique le problème ne se voit pas, mais il existe. Pour du multi-nœuds, il faut un stockage réseau (Longhorn, NFS, Ceph ou un stockage cloud).
+- **`reclaimPolicy: Delete`** : supprimer le PVC supprime aussi le volume et ses données.
+
+---
+
+## 9. Partie 7 : HorizontalPodAutoscaler
+
+`metrics-server` fonctionne (`kubectl top nodes` : 5 % de CPU, 59 % de mémoire). Le HPA `whoami` cible le Deployment `whoami` : minimum 2, maximum 6 réplicas, seuil de 50 % d'utilisation CPU (par rapport aux `requests`, ce qui exige que `requests.cpu` soit défini : 50m, donc environ 25m par Pod pour déclencher).
+
+![metrics-server et manifest du HPA](captures/tp14/metrics-hpa-manifest.png)
+
+Charge générée depuis un Pod `busybox` qui lance 4 boucles `wget` en parallèle contre `http://whoami` :
+
+![Pods whoami et consommation CPU sous charge](captures/tp14/hpa-charge-pods.png)
+
+Sous charge, `TARGETS` dépasse largement la cible (`160 %/50 %`) et `REPLICAS` monte au maximum (6). Chaque Pod `whoami` consomme environ 80 à 90m de CPU.
+
+Après l'arrêt de la charge, l'utilisation retombe à 2 % et `REPLICAS` redescend de 6 à 3 puis à 2, environ cinq minutes plus tard : c'est la fenêtre de stabilisation par défaut du HPA (5 minutes), qui évite les oscillations.
+
+![HPA : descente de 6 à 2 réplicas et historique des décisions](captures/tp14/hpa.png)
+
+Les `Events` du HPA confirment : `New size: 4` puis `New size: 6` (`cpu resource utilization above target`), puis `New size: 3` et `New size: 2` (`All metrics below target`).
+
+---
+
+## 10. Défi
+
+Non réalisé : le troisième nœud et `kubectl drain` supposent un cluster multi-nœuds. Sur mon nœud unique, un `drain` rendrait le nœud non planifiable et déplacerait aussi les autres applications du cluster. Le PodDisruptionBudget n'a pas été testé pour la même raison.
+
+---
+
+## 11. Difficultés rencontrées
+
+- **Ressources insuffisantes pour Vagrant** (4 vCPU, 4,2 Gio de RAM, VirtualBox absent) : passage au plan B en nœud unique, sur un cluster K3s préexistant que j'ai conservé.
+- **`sudo` et Ansible** : `Timed out waiting for become success or become password prompt`, probablement à cause du `sudo` de Ubuntu 26.04 ; contourné en lançant `ansible-playbook` en root.
+- **Téléchargements lents** : une image de plusieurs dizaines de Mo prend plusieurs minutes (jusqu'à 22 minutes pour `postgres:17-alpine`). Un `rollout status` avec un délai de 180 secondes expirait donc alors que le déploiement continuait en arrière-plan.
+- **PostgreSQL ne démarrait pas** : le conteneur restait `1/1 Running` sans que le serveur soit lancé (aucune ligne dans `logs`, processus `gosu` à 100 % de CPU). Après un passage en utilisateur non root (`runAsUser: 70`), l'erreur est devenue `could not signal for checkpoint: Permission denied`. Le journal du noyau (`dmesg`) contenait des refus `apparmor="DENIED" operation="signal"` pour le profil `cri-containerd.apparmor.d`. Ajouter `appArmorProfile: Unconfined` au `securityContext` du Pod a réglé le problème. C'est un contournement propre à cette VM, qui réduit l'isolation du conteneur ; ce n'est pas une bonne pratique générale. La cause du blocage initial dans `gosu` n'est pas établie avec certitude.
+- **Limite mémoire de `whoami`** : 4 Mi et 8 Mi n'ont pas provoqué d'`OOMKilled`, d'où l'usage d'un Pod de démonstration.
+
+---
+
+## 12. Liste des captures
+
+| Fichier | Contenu |
+|---|---|
+| `cluster-nodes.png` | Nœud `Ready`, pods système, `PLAY RECAP` de la première exécution |
+| `rebuild.png` | Deuxième exécution du playbook : `changed=0` (idempotence) |
+| `ingress.png` | `curl` sur `whoami.lab.local` et `/api`, Services et Ingress |
+| `probes-restart.png` | Pod redémarré par la livenessProbe (`RESTARTS 1`, `Unhealthy`, `Killing`) |
+| `rollout-undo.png` | `ImagePullBackOff`, `rollout history`, `rollout undo` |
+| `pvc-persistence.png` | Donnée PostgreSQL conservée après suppression du Pod |
+| `hpa.png` | HPA : descente de 6 à 2 réplicas et événements de mise à l'échelle |
+
+Captures complémentaires :
+
+| Fichier | Contenu |
+|---|---|
+| `configmap-restart.png` | ConfigMap : avant, après `apply`, après `rollout restart` |
+| `probes-config.png` | Probes, `requests`/`limits` et QoS `Burstable` |
+| `oomkilled.png` | Pod tué par manque de mémoire (`OOMKilled`, 137) |
+| `pv-stockage.png` | PV, PVC, chemin sur le nœud et affinité de nœud |
+| `metrics-hpa-manifest.png` | `kubectl top` et manifest du HPA |
+| `hpa-charge-pods.png` | 6 Pods `whoami` et consommation CPU sous charge |
