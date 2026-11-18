@@ -1,0 +1,7 @@
+replicaCount: 1
+
+ingress:
+  enabled: true
+
+env:
+  WHOAMI_NAME: dev

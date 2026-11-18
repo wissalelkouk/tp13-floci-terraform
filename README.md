@@ -1,4 +1,4 @@
-> Ce dépôt regroupe deux TP : **TP13** (Floci, Terraform, OpenTofu) et **TP14** (K3s et Kubernetes, voir [TP14](#tp14--kubernetes-avec-k3s)).
+> Ce dépôt regroupe trois TP : **TP13** (Floci, Terraform, OpenTofu), **TP14** (K3s et Kubernetes, voir [TP14](#tp14--kubernetes-avec-k3s)) et **TP15** (Helm et Kustomize, voir [TP15](#tp15--packager-une-application-kubernetes-avec-helm-et-kustomize)).
 
 # TP13 : Cloud AWS local avec Floci et Terraform avancé
 
@@ -790,3 +790,655 @@ Captures complémentaires :
 | `pv-stockage.png` | PV, PVC, chemin sur le nœud et affinité de nœud |
 | `metrics-hpa-manifest.png` | `kubectl top` et manifest du HPA |
 | `hpa-charge-pods.png` | 6 Pods `whoami` et consommation CPU sous charge |
+---
+
+# TP15 : Packager une application Kubernetes avec Helm et Kustomize
+
+[#tp15--packager-une-application-kubernetes-avec-helm-et-kustomize](#tp15--packager-une-application-kubernetes-avec-helm-et-kustomize)
+
+**Auteur :** Wissal **Date :** 18 novembre 2026 **Environnement :** Ubuntu Server 26.04, K3s v1.36.5+k3s1 (nœud unique, TP14), Helm v3.22.1, `kubectl` avec Kustomize intégré
+
+Une même application (`traefik/whoami`) est packagée de deux façons, avec Helm puis avec Kustomize, et les deux outils sont comparés.
+
+---
+
+## Sommaire
+
+[#sommaire-2](#sommaire-2)
+
+1. [Structure du rendu](#1-structure-du-rendu-1)
+2. [Partie 1 : consommer un chart public](#2-partie-1--consommer-un-chart-public)
+3. [Partie 2 : écrire son chart](#3-partie-2--écrire-son-chart)
+4. [Partie 3 : cycle de vie d'une release](#4-partie-3--cycle-de-vie-dune-release)
+5. [Partie 4 : Kustomize, base et overlays](#5-partie-4--kustomize-base-et-overlays)
+6. [Partie 5 : comparaison Helm / Kustomize](#6-partie-5--comparaison-helm--kustomize)
+7. [Défis](#7-défis)
+8. [Difficultés rencontrées](#8-difficultés-rencontrées-1)
+9. [Liste des captures](#9-liste-des-captures)
+
+---
+
+## 1. Structure du rendu
+
+[#1-structure-du-rendu-1](#1-structure-du-rendu-1)
+
+Les fichiers du TP15 sont dans le dossier `tp15/` du dépôt, et ses captures dans `captures/tp15/` :
+
+```
+tp15/
+├── chart-starter/whoami/
+│   ├── Chart.yaml
+│   ├── values.yaml
+│   ├── values.schema.json          (défi)
+│   └── templates/
+│       ├── _helpers.tpl
+│       ├── deployment.yaml
+│       ├── service.yaml
+│       ├── ingress.yaml
+│       └── NOTES.txt
+├── values-dev.yaml
+├── values-prod.yaml
+└── kustomize-starter/
+    ├── base/
+    │   ├── kustomization.yaml
+    │   ├── deployment.yaml
+    │   └── service.yaml
+    └── overlays/
+        ├── dev/
+        ├── staging/
+        └── prod/
+captures/tp15/            (captures d'écran du TP15)
+```
+
+---
+
+## 2. Partie 1 : consommer un chart public
+
+[#2-partie-1--consommer-un-chart-public](#2-partie-1--consommer-un-chart-public)
+
+```
+helm repo add podinfo https://stefanprodan.github.io/podinfo && helm repo update
+helm search repo podinfo
+helm show values podinfo/podinfo | less
+helm install demo podinfo/podinfo -n helm-demo --create-namespace --set replicaCount=2
+helm list -A
+helm get values demo -n helm-demo
+helm get manifest demo -n helm-demo | head -40
+kubectl -n helm-demo get secrets
+helm uninstall demo -n helm-demo
+```
+
+- `helm get values` n'affiche que les **surcharges** (`replicaCount: 2`), alors que `helm get manifest` montre le YAML **réellement appliqué**.
+- **Où Helm stocke-t-il l'historique d'une release ?** Dans des **Secrets** de type `helm.sh/release.v1`, **un par révision** (ici `sh.helm.release.v1.demo.v1`), dans le namespace de la release. Un `helm upgrade` crée `...v2`, et ainsi de suite.
+
+Le déploiement a donné `2/2` pods `Running` (image `ghcr.io/stefanprodan/podinfo:6.17.0`).
+
+---
+
+## 3. Partie 2 : écrire son chart
+
+[#3-partie-2--écrire-son-chart](#3-partie-2--écrire-son-chart)
+
+**`version` et `appVersion`** : `version` (0.1.x) est la version du **chart** et doit être incrémentée à chaque modification des templates ou des values ; `appVersion` (`v1.10.0`) est la version de l'**application** et sert de tag d'image par défaut (`image.tag` vide).
+
+Les TODO ont été complétés :
+
+- `values.yaml` : ajout de la map `env` (`WHOAMI_NAME`).
+- `deployment.yaml` : bloc `env:` généré par `with` et `range $name, $value := .` (valeurs forcées en chaîne avec `quote`), `readinessProbe` et `livenessProbe` HTTP sur `/health` (port nommé `http`).
+- `service.yaml` : nom, labels, type et port viennent des helpers et de `.Values.service`, `selector` avec `whoami.selectorLabels` et `targetPort: http`.
+- `ingress.yaml` : généré **seulement si** `ingress.enabled` vaut `true` (`ingressClassName`, `host`, backend vers le Service du chart).
+
+Les `selectorLabels` (nom et instance) ne contiennent ni version ni numéro de chart : le `selector` d'un Deployment est **immuable** et ne doit pas changer entre deux versions.
+
+| Fonction Helm utilisée | Usage dans le chart                                                       |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `include` + `nindent`  | Insérer les helpers de labels avec la bonne indentation                   |
+| `default`              | `.Values.image.tag \| default .Chart.AppVersion`                          |
+| `toYaml`               | Recopier le bloc `resources` tel quel                                     |
+| `quote`                | Forcer une chaîne pour les valeurs d'`env`                                |
+
+Validation :
+
+```
+helm lint chart-starter/whoami
+helm template test chart-starter/whoami --set ingress.enabled=true | less
+helm install test chart-starter/whoami --dry-run=server -n tp15 --create-namespace
+```
+
+`helm lint` : `1 chart(s) linted, 0 chart(s) failed` (seul message : `[INFO] icon is recommended`). Le rendu contient l'image `traefik/whoami:v1.10.0` (tag par défaut = `appVersion`), l'`env`, les deux probes et les `resources`. Avec `--set ingress.enabled=true`, l'Ingress apparaît (`ingressClassName: traefik`, `host: "whoami.lab.local"`). Le `--dry-run=server` est accepté par le serveur d'API sans rien déployer (release en `pending-install`).
+
+[![helm lint, helm template et Ingress généré](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-lint-template.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-lint-template.png)
+
+---
+
+## 4. Partie 3 : cycle de vie d'une release
+
+[#4-partie-3--cycle-de-vie-dune-release](#4-partie-3--cycle-de-vie-dune-release)
+
+`values-dev.yaml` (1 replica, Ingress activé, `WHOAMI_NAME: dev`) et `values-prod.yaml` (3 replicas, `limits` plus élevées) ont été créés. Seul `values-dev.yaml` a été installé sur le cluster.
+
+```
+helm install whoami chart-starter/whoami -n tp15 --create-namespace -f values-dev.yaml
+curl http://whoami.lab.local
+helm upgrade whoami chart-starter/whoami -n tp15 -f values-dev.yaml --set replicaCount=3
+helm upgrade whoami chart-starter/whoami -n tp15 -f values-dev.yaml --set image.tag=v9.9.9
+kubectl -n tp15 get pods
+helm history whoami -n tp15
+helm rollback whoami 2 -n tp15
+helm history whoami -n tp15
+```
+
+| Révision | Action                          | Résultat observé                                                                                      |
+| -------- | ------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| 1        | `install`                       | `curl http://whoami.lab.local` répond `Name: dev`                                                     |
+| 2        | `upgrade` (`replicaCount=3`)    | 3 pods `Running`                                                                                      |
+| 3        | `upgrade` (`image.tag=v9.9.9`)  | Nouveau pod en `ErrImagePull`, ancien pod toujours `Running` ; Helm affiche pourtant `STATUS: deployed` |
+| 4        | `rollback` vers la révision 2   | Description `Rollback to 2`, révisions 1 à 3 conservées                                               |
+
+**Le rollback crée une NOUVELLE révision** (la 4, copie de la 2) : l'historique n'est jamais effacé. Sans `--atomic` ni `--wait`, Helm considère l'upgrade réussi dès que les manifests sont appliqués, sans vérifier la santé des pods.
+
+[![helm history après upgrade, échec et rollback](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-history.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-history.png)
+
+### Mise à jour défaillante avec `--atomic`
+
+[#mise-à-jour-défaillante-avec---atomic](#mise-à-jour-défaillante-avec---atomic)
+
+```
+helm upgrade whoami chart-starter/whoami -n tp15 -f values-dev.yaml \
+  --set image.tag=v9.9.9 --atomic --timeout 90s
+```
+
+**Que fait Helm cette fois-ci ?** Il attend que les nouveaux pods deviennent `Ready`, constate qu'ils n'y arrivent pas (`ErrImagePull`), déclare la révision en `failed` puis **revient seul à la version précédente** : `release whoami failed, and has been rolled back due to atomic being set`. Le dernier `helm history` montre une révision `failed` (8) suivie d'une révision `Rollback to 7` (9) en `deployed`, avec 3 pods `Running`.
+
+Avec `--timeout 60s`, le rollback automatique a lui-même échoué (`an error occurred while rolling back the release`) : le retour arrière consomme le même délai, qui était déjà écoulé. La release est restée en `failed` (révision 6) et a été remise d'aplomb avec `helm rollback whoami 4 --wait --timeout 120s` (révision 7). Un délai de 90 s a suffi pour la reprise propre.
+
+[![Upgrade --atomic annulé automatiquement](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-atomic.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-atomic.png)
+
+### Empaquetage
+
+[#empaquetage](#empaquetage)
+
+```
+helm package chart-starter/whoami        # whoami-0.1.0.tgz
+sed -i 's/^version: 0.1.0/version: 0.1.1/' chart-starter/whoami/Chart.yaml
+helm package chart-starter/whoami        # whoami-0.1.1.tgz
+```
+
+Le nom de l'archive suit `version` de `Chart.yaml`, pas `appVersion` : c'est ce numéro qu'un dépôt de charts utilise pour distinguer les versions.
+
+---
+
+## 5. Partie 4 : Kustomize, base et overlays
+
+[#5-partie-4--kustomize-base-et-overlays](#5-partie-4--kustomize-base-et-overlays)
+
+La **base** contient le Deployment, le Service et un `configMapGenerator` (`whoami-config`) ; elle ajoute le label `app.kubernetes.io/part-of: tp15` avec `includeSelectors: false` (les selectors ne changent pas). Chaque **overlay** ne contient que les différences :
+
+| Overlay   | Namespace      | Replicas | Particularités                                                                  |
+| --------- | -------------- | -------- | ------------------------------------------------------------------------------- |
+| `dev`     | `tp15-dev`     | 1        | `WHOAMI_NAME=dev`, `LOG_LEVEL=debug` (fourni)                                   |
+| `staging` | `tp15-staging` | 2        | `WHOAMI_NAME=staging`, `LOG_LEVEL=info`                                         |
+| `prod`    | `tp15-prod`    | 3        | image `v1.10.1` (champ `images`), `limits.memory: 128Mi` (patch), `readinessProbe` (patch stratégique dans `readiness-patch.yaml`) |
+
+La prévisualisation (`kubectl kustomize`) montre :
+
+- le **namespace** appliqué à toutes les ressources ;
+- un ConfigMap au nom suffixé d'un **hash** (`whoami-config-6t5d5gdccm` pour dev), dont le nom est **réécrit automatiquement** dans `envFrom` du Deployment ;
+- le label `app.kubernetes.io/part-of: tp15` ajouté partout.
+
+Déploiement et comparaison :
+
+```
+kubectl apply -k kustomize-starter/overlays/dev
+kubectl apply -k kustomize-starter/overlays/staging
+kubectl apply -k kustomize-starter/overlays/prod
+kubectl get deploy -A -l app.kubernetes.io/part-of=tp15
+diff <(kubectl kustomize kustomize-starter/overlays/staging) <(kubectl kustomize kustomize-starter/overlays/prod)
+```
+
+Résultat : `tp15-dev` 1/1, `tp15-staging` 2/2, `tp15-prod` 3/3.
+
+[![Trois Deployments avec des replicas différents](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-envs.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-envs.png)
+
+Le `diff` staging / prod montre exactement les écarts attendus : namespace, hash et contenu du ConfigMap, replicas (2 contre 3), tag d'image (`v1.10.0` contre `v1.10.1`), `readinessProbe` (prod seulement) et `limits.memory` (64Mi contre 128Mi).
+
+[![diff staging / prod](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-diff.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-diff.png)
+
+### Pourquoi les Pods sont-ils recréés quand `LOG_LEVEL` change ?
+
+[#pourquoi-les-pods-sont-ils-recréés-quand-log_level-change-](#pourquoi-les-pods-sont-ils-recréés-quand-log_level-change-)
+
+`LOG_LEVEL` passe de `debug` à `trace` dans l'overlay dev, puis `kubectl apply -k` est relancé :
+
+- le contenu du ConfigMap change, donc son **hash** change, donc son **nom** : `whoami-config-6t5d5gdccm` devient `whoami-config-9mtdt796g2` ;
+- Kustomize réécrit ce nom dans `envFrom` du Deployment (`deployment.apps/whoami configured`), ce qui **modifie le template de Pod** ;
+- Kubernetes fait un rolling update : le nouveau pod devient `Running`, puis l'ancien est terminé.
+
+Dans le TP14, le ConfigMap avait un **nom fixe** : modifier ses données ne changeait pas le Deployment, donc aucun Pod n'était recréé sans `kubectl rollout restart`.
+
+Vérification : le Deployment référence `whoami-config-9mtdt796g2`, qui contient `{"LOG_LEVEL":"trace","WHOAMI_NAME":"dev"}`, et un `port-forward` sur le pod renvoie `Name: dev`. L'ancien ConfigMap reste en place, car `kubectl apply -k` ne supprime rien sans `--prune`.
+
+---
+
+## 6. Partie 5 : comparaison Helm / Kustomize
+
+[#6-partie-5--comparaison-helm--kustomize](#6-partie-5--comparaison-helm--kustomize)
+
+| Critère                               | Helm                                                                              | Kustomize                                                                       |
+| ------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Mécanisme (template / patch)          | Templates Go + fichiers `values` : le YAML est généré                             | Patches et transformateurs appliqués à une base en YAML pur, sans template      |
+| Gestion des releases et rollback      | Oui : révisions stockées dans des Secrets, `history`, `rollback`, `--atomic`      | Non : pas de notion de release, le retour arrière passe par Git ou `kubectl rollout undo` |
+| Distribution d'un logiciel à des tiers | Très adapté : charts versionnés, dépôts, registres OCI, `helm install`           | Peu adapté : dossiers ou dépôts Git, sans versionnement de paquet               |
+| Lisibilité du YAML final              | Moyenne : les templates mélangent YAML et logique (`{{ }}`, `nindent`)            | Bonne : la base est du YAML valide, les overlays ne contiennent que les différences |
+| Intégré à kubectl                     | Non : binaire séparé à installer                                                  | Oui : `kubectl apply -k` et `kubectl kustomize`                                 |
+| Support par Argo CD                   | Oui, natif                                                                        | Oui, natif                                                                      |
+
+**Quand utiliser les deux ensemble ?** Pour déployer un chart tiers en l'adaptant sans le forker : on déclare le chart avec `helmCharts:` dans une `kustomization.yaml`, ou on fait `helm template` puis on applique des patches Kustomize (labels, `resources`, sidecar). Helm apporte le paquet, Kustomize la personnalisation par environnement.
+
+---
+
+## 7. Défis
+
+[#7-défis](#7-défis)
+
+### Défi 1 : `values.schema.json` (réalisé)
+
+[#défi-1--valuesschemajson-réalisé](#défi-1--valuesschemajson-réalisé)
+
+Un schéma JSON (`replicaCount` entier d'au moins 1, `containerPort` entier, `image.repository` et `image.tag` chaînes, `ingress.enabled` booléen) valide les values avant tout rendu.
+
+```
+helm lint chart-starter/whoami                                   # 0 chart(s) failed
+helm lint chart-starter/whoami --set replicaCount=trois          # at '/replicaCount': got string, want integer
+helm template test chart-starter/whoami --set replicaCount=0     # at '/replicaCount': minimum: got 0, want 1
+helm template test chart-starter/whoami --set replicaCount=2    # replicas: 2
+```
+
+Le schéma bloque donc aussi `helm template` et `helm install`, pas seulement `helm lint`.
+
+[![helm lint refuse replicaCount: "trois"](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-schema.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-schema.png)
+
+### Défi 2 : registre OCI Harbor (non réalisé)
+
+[#défi-2--registre-oci-harbor-non-réalisé](#défi-2--registre-oci-harbor-non-réalisé)
+
+Au moment du TP, seul le conteneur `harbor-log` tournait : les autres conteneurs Harbor (`nginx`, `core`, `registry`) étaient arrêtés, et `https://harbor.lab.local/api/v2.0/health` renvoyait `404` (c'est le Traefik de K3s qui répond sur les ports 80 et 443, pas Harbor). Le `helm push` vers `oci://harbor.lab.local/devsecops` n'a donc pas été testé. Un registre `local-registry` tourne sur le port 5000 et pourrait servir de substitut avec `--plain-http`.
+
+---
+
+## 8. Difficultés rencontrées
+
+[#8-difficultés-rencontrées-1](#8-difficultés-rencontrées-1)
+
+- **Pull d'image très lent** : les pods `podinfo` sont restés plusieurs minutes en `ContainerCreating` (événement `Pulling image` sans suite), sur une résolution DNS64 (`64:ff9b::`) de `ghcr.io`. Résolu en pré-téléchargeant l'image avec `sudo k3s crictl pull`, puis en faisant de même pour `traefik/whoami` avant les parties suivantes.
+- **`--atomic --timeout 60s`** : le rollback automatique a échoué faute de temps (release en `failed`). Réparation par `helm rollback ... --wait --timeout 120s`, puis nouvel essai réussi avec `--timeout 90s`.
+- **`kubectl exec ... -- env` impossible** : l'image `traefik/whoami` ne contient aucun binaire (`executable file not found in $PATH`). La valeur de `LOG_LEVEL` a été vérifiée avec `jsonpath` sur le Deployment et le ConfigMap, et `WHOAMI_NAME` avec un `port-forward`.
+- **Port local 8080 déjà utilisé** par un Jenkins (`address already in use`) : le `curl` interrogeait Jenkins sans que l'on s'en aperçoive. Solution : `port-forward` sur le port 18080.
+- **Chevrons laissés dans les commandes** : `<IP>` et `<tag>` d'un énoncé sont des emplacements à remplacer, ce qui a fait échouer l'entrée `/etc/hosts` et un `crictl pull`.
+- **Fichiers de départ absents de la VM** : `chart-starter.zip` et `kustomize-starter.zip` étaient sur Windows, copiés avec `scp` avant extraction.
+- **Harbor arrêté** : voir le défi 2.
+
+---
+
+## 9. Liste des captures
+
+[#9-liste-des-captures](#9-liste-des-captures)
+
+| Fichier                   | Contenu                                                              |
+| ------------------------- | -------------------------------------------------------------------- |
+| `helm-lint-template.png`  | `helm lint` sans erreur, extrait de `helm template` et Ingress       |
+| `helm-history.png`        | `helm history` après upgrade, échec et rollback                      |
+| `helm-atomic.png`         | Upgrade `--atomic` annulé automatiquement                            |
+| `kustomize-envs.png`      | Trois Deployments (dev / staging / prod) avec des replicas différents |
+| `kustomize-diff.png`      | `diff` staging / prod                                                |
+| `helm-schema.png`         | `helm lint` refusant `replicaCount: "trois"` (défi 1)                |
+---
+
+# TP15 : Packager une application Kubernetes avec Helm et Kustomize
+
+[#tp15--packager-une-application-kubernetes-avec-helm-et-kustomize](#tp15--packager-une-application-kubernetes-avec-helm-et-kustomize)
+
+**Auteur :** Wissal **Date :** 18 novembre 2026 **Environnement :** Ubuntu Server 26.04, K3s v1.36.5+k3s1 (nœud unique, TP14), Helm v3.22.1, `kubectl` avec Kustomize intégré
+
+Une même application (`traefik/whoami`) est packagée de deux façons, avec Helm puis avec Kustomize, et les deux outils sont comparés.
+
+---
+
+## Sommaire
+
+[#sommaire-2](#sommaire-2)
+
+1. [Structure du rendu](#1-structure-du-rendu-1)
+2. [Partie 1 : consommer un chart public](#2-partie-1--consommer-un-chart-public)
+3. [Partie 2 : écrire son chart](#3-partie-2--écrire-son-chart)
+4. [Partie 3 : cycle de vie d'une release](#4-partie-3--cycle-de-vie-dune-release)
+5. [Partie 4 : Kustomize, base et overlays](#5-partie-4--kustomize-base-et-overlays)
+6. [Partie 5 : comparaison Helm / Kustomize](#6-partie-5--comparaison-helm--kustomize)
+7. [Défis](#7-défis)
+8. [Difficultés rencontrées](#8-difficultés-rencontrées-1)
+9. [Liste des captures](#9-liste-des-captures)
+
+---
+
+## 1. Structure du rendu
+
+[#1-structure-du-rendu-1](#1-structure-du-rendu-1)
+
+Les fichiers du TP15 sont dans le dossier `tp15/` du dépôt, et ses captures dans `captures/tp15/` :
+
+```
+tp15/
+├── chart-starter/whoami/
+│   ├── Chart.yaml
+│   ├── values.yaml
+│   ├── values.schema.json          (défi)
+│   └── templates/
+│       ├── _helpers.tpl
+│       ├── deployment.yaml
+│       ├── service.yaml
+│       ├── ingress.yaml
+│       └── NOTES.txt
+├── values-dev.yaml
+├── values-prod.yaml
+└── kustomize-starter/
+    ├── base/
+    │   ├── kustomization.yaml
+    │   ├── deployment.yaml
+    │   └── service.yaml
+    └── overlays/
+        ├── dev/
+        ├── staging/
+        └── prod/
+captures/tp15/            (captures d'écran du TP15)
+```
+
+---
+
+## 2. Partie 1 : consommer un chart public
+
+[#2-partie-1--consommer-un-chart-public](#2-partie-1--consommer-un-chart-public)
+
+```
+helm repo add podinfo https://stefanprodan.github.io/podinfo && helm repo update
+helm search repo podinfo
+helm show values podinfo/podinfo | less
+helm install demo podinfo/podinfo -n helm-demo --create-namespace --set replicaCount=2
+helm list -A
+helm get values demo -n helm-demo
+helm get manifest demo -n helm-demo | head -40
+kubectl -n helm-demo get secrets
+helm uninstall demo -n helm-demo
+```
+
+- `helm get values` n'affiche que les **surcharges** (`replicaCount: 2`), alors que `helm get manifest` montre le YAML **réellement appliqué**.
+- **Où Helm stocke-t-il l'historique d'une release ?** Dans des **Secrets** de type `helm.sh/release.v1`, **un par révision** (ici `sh.helm.release.v1.demo.v1`), dans le namespace de la release. Un `helm upgrade` crée `...v2`, et ainsi de suite.
+
+Le déploiement a donné `2/2` pods `Running` (image `ghcr.io/stefanprodan/podinfo:6.17.0`).
+
+[![podinfo : 2 pods Running et replicaCount: 2](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-podinfo-pods.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-podinfo-pods.png)
+
+---
+
+## 3. Partie 2 : écrire son chart
+
+[#3-partie-2--écrire-son-chart](#3-partie-2--écrire-son-chart)
+
+**`version` et `appVersion`** : `version` (0.1.x) est la version du **chart** et doit être incrémentée à chaque modification des templates ou des values ; `appVersion` (`v1.10.0`) est la version de l'**application** et sert de tag d'image par défaut (`image.tag` vide).
+
+Les TODO ont été complétés :
+
+- `values.yaml` : ajout de la map `env` (`WHOAMI_NAME`).
+- `deployment.yaml` : bloc `env:` généré par `with` et `range $name, $value := .` (valeurs forcées en chaîne avec `quote`), `readinessProbe` et `livenessProbe` HTTP sur `/health` (port nommé `http`).
+- `service.yaml` : nom, labels, type et port viennent des helpers et de `.Values.service`, `selector` avec `whoami.selectorLabels` et `targetPort: http`.
+- `ingress.yaml` : généré **seulement si** `ingress.enabled` vaut `true` (`ingressClassName`, `host`, backend vers le Service du chart).
+
+Les `selectorLabels` (nom et instance) ne contiennent ni version ni numéro de chart : le `selector` d'un Deployment est **immuable** et ne doit pas changer entre deux versions.
+
+| Fonction Helm utilisée | Usage dans le chart                                                       |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `include` + `nindent`  | Insérer les helpers de labels avec la bonne indentation                   |
+| `default`              | `.Values.image.tag \| default .Chart.AppVersion`                          |
+| `toYaml`               | Recopier le bloc `resources` tel quel                                     |
+| `quote`                | Forcer une chaîne pour les valeurs d'`env`                                |
+
+Validation :
+
+```
+helm lint chart-starter/whoami
+helm template test chart-starter/whoami --set ingress.enabled=true | less
+helm install test chart-starter/whoami --dry-run=server -n tp15 --create-namespace
+```
+
+`helm lint` : `1 chart(s) linted, 0 chart(s) failed` (seul message : `[INFO] icon is recommended`). Le rendu contient l'image `traefik/whoami:v1.10.0` (tag par défaut = `appVersion`), l'`env`, les deux probes et les `resources`. Avec `--set ingress.enabled=true`, l'Ingress apparaît (`ingressClassName: traefik`, `host: "whoami.lab.local"`). Le `--dry-run=server` est accepté par le serveur d'API sans rien déployer (release en `pending-install`).
+
+[![helm lint sans erreur](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-lint.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-lint.png)
+
+[![dry-run=server (début)](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-dry-run-debut.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-dry-run-debut.png)
+
+[![dry-run=server (fin, NOTES)](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-dry-run-fin.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-dry-run-fin.png)
+
+[![helm lint, helm template et Ingress généré](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-lint-template.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-lint-template.png)
+
+---
+
+## 4. Partie 3 : cycle de vie d'une release
+
+[#4-partie-3--cycle-de-vie-dune-release](#4-partie-3--cycle-de-vie-dune-release)
+
+`values-dev.yaml` (1 replica, Ingress activé, `WHOAMI_NAME: dev`) et `values-prod.yaml` (3 replicas, `limits` plus élevées) ont été créés. Seul `values-dev.yaml` a été installé sur le cluster.
+
+```
+helm install whoami chart-starter/whoami -n tp15 --create-namespace -f values-dev.yaml
+curl http://whoami.lab.local
+helm upgrade whoami chart-starter/whoami -n tp15 -f values-dev.yaml --set replicaCount=3
+helm upgrade whoami chart-starter/whoami -n tp15 -f values-dev.yaml --set image.tag=v9.9.9
+kubectl -n tp15 get pods
+helm history whoami -n tp15
+helm rollback whoami 2 -n tp15
+helm history whoami -n tp15
+```
+
+| Révision | Action                          | Résultat observé                                                                                      |
+| -------- | ------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| 1        | `install`                       | `curl http://whoami.lab.local` répond `Name: dev`                                                     |
+| 2        | `upgrade` (`replicaCount=3`)    | 3 pods `Running`                                                                                      |
+| 3        | `upgrade` (`image.tag=v9.9.9`)  | Nouveau pod en `ErrImagePull`, ancien pod toujours `Running` ; Helm affiche pourtant `STATUS: deployed` |
+| 4        | `rollback` vers la révision 2   | Description `Rollback to 2`, révisions 1 à 3 conservées                                               |
+
+**Le rollback crée une NOUVELLE révision** (la 4, copie de la 2) : l'historique n'est jamais effacé. Sans `--atomic` ni `--wait`, Helm considère l'upgrade réussi dès que les manifests sont appliqués, sans vérifier la santé des pods.
+
+[![Révision 1 : install et curl (Name: dev)](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-install-dev.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-install-dev.png)
+
+[![Révision 2 : 3 pods](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-upgrade-rev2.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-upgrade-rev2.png)
+
+[![Révision 3 : ErrImagePull, ancien pod toujours Running](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-upgrade-rev3-echec.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-upgrade-rev3-echec.png)
+
+[![helm history après upgrade, échec et rollback](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-history.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-history.png)
+
+### Mise à jour défaillante avec `--atomic`
+
+[#mise-à-jour-défaillante-avec---atomic](#mise-à-jour-défaillante-avec---atomic)
+
+```
+helm upgrade whoami chart-starter/whoami -n tp15 -f values-dev.yaml \
+  --set image.tag=v9.9.9 --atomic --timeout 90s
+```
+
+**Que fait Helm cette fois-ci ?** Il attend que les nouveaux pods deviennent `Ready`, constate qu'ils n'y arrivent pas (`ErrImagePull`), déclare la révision en `failed` puis **revient seul à la version précédente** : `release whoami failed, and has been rolled back due to atomic being set`. Le test a été refait sur une release réinstallée (historique repartant de 1) : `helm history` montre une révision `failed` (4, `context deadline exceeded`) suivie d'une révision `Rollback to 3` (5) en `deployed`, et le pod est `1/1 Running`, sans pod en erreur. La révision 2 `failed` (`context canceled`) correspond à une première tentative interrompue avant la fin ; elle a été annulée par Helm (révision 3, `Rollback to 1`).
+
+Avec `--timeout 60s`, le rollback automatique a lui-même échoué (`an error occurred while rolling back the release`) : le retour arrière consomme le même délai, qui était déjà écoulé. La release est restée en `failed` (révision 6) et a été remise d'aplomb avec `helm rollback whoami 4 --wait --timeout 120s` (révision 7). Un délai de 90 s a suffi pour la reprise propre.
+
+[![Historique du premier essai (timeout 60 s puis 90 s)](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-atomic-historique.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-atomic-historique.png)
+
+[![Upgrade --atomic annulé automatiquement](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-atomic.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-atomic.png)
+
+### Empaquetage
+
+[#empaquetage](#empaquetage)
+
+```
+helm package chart-starter/whoami        # whoami-0.1.0.tgz
+sed -i 's/^version: 0.1.0/version: 0.1.1/' chart-starter/whoami/Chart.yaml
+helm package chart-starter/whoami        # whoami-0.1.1.tgz
+```
+
+Le nom de l'archive suit `version` de `Chart.yaml`, pas `appVersion` : c'est ce numéro qu'un dépôt de charts utilise pour distinguer les versions.
+
+[![helm package 0.1.0](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-package-0.1.0.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-package-0.1.0.png)
+
+[![helm package 0.1.1](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-package-0.1.1.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-package-0.1.1.png)
+
+---
+
+## 5. Partie 4 : Kustomize, base et overlays
+
+[#5-partie-4--kustomize-base-et-overlays](#5-partie-4--kustomize-base-et-overlays)
+
+La **base** contient le Deployment, le Service et un `configMapGenerator` (`whoami-config`) ; elle ajoute le label `app.kubernetes.io/part-of: tp15` avec `includeSelectors: false` (les selectors ne changent pas). Chaque **overlay** ne contient que les différences :
+
+| Overlay   | Namespace      | Replicas | Particularités                                                                  |
+| --------- | -------------- | -------- | ------------------------------------------------------------------------------- |
+| `dev`     | `tp15-dev`     | 1        | `WHOAMI_NAME=dev`, `LOG_LEVEL=debug` (fourni)                                   |
+| `staging` | `tp15-staging` | 2        | `WHOAMI_NAME=staging`, `LOG_LEVEL=info`                                         |
+| `prod`    | `tp15-prod`    | 3        | image `v1.10.1` (champ `images`), `limits.memory: 128Mi` (patch), `readinessProbe` (patch stratégique dans `readiness-patch.yaml`) |
+
+La prévisualisation (`kubectl kustomize`) montre :
+
+- le **namespace** appliqué à toutes les ressources ;
+- un ConfigMap au nom suffixé d'un **hash** (`whoami-config-6t5d5gdccm` pour dev), dont le nom est **réécrit automatiquement** dans `envFrom` du Deployment ;
+- le label `app.kubernetes.io/part-of: tp15` ajouté partout.
+
+Déploiement et comparaison :
+
+```
+kubectl apply -k kustomize-starter/overlays/dev
+kubectl apply -k kustomize-starter/overlays/staging
+kubectl apply -k kustomize-starter/overlays/prod
+kubectl get deploy -A -l app.kubernetes.io/part-of=tp15
+diff <(kubectl kustomize kustomize-starter/overlays/staging) <(kubectl kustomize kustomize-starter/overlays/prod)
+```
+
+Résultat : `tp15-dev` 1/1, `tp15-staging` 2/2, `tp15-prod` 3/3.
+
+[![Trois Deployments avec des replicas différents](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-envs.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-envs.png)
+
+Le `diff` staging / prod montre exactement les écarts attendus : namespace, hash et contenu du ConfigMap, replicas (2 contre 3), tag d'image (`v1.10.0` contre `v1.10.1`), `readinessProbe` (prod seulement) et `limits.memory` (64Mi contre 128Mi).
+
+[![diff staging / prod](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-diff.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-diff.png)
+
+### Pourquoi les Pods sont-ils recréés quand `LOG_LEVEL` change ?
+
+[#pourquoi-les-pods-sont-ils-recréés-quand-log_level-change-](#pourquoi-les-pods-sont-ils-recréés-quand-log_level-change-)
+
+`LOG_LEVEL` passe de `debug` à `trace` dans l'overlay dev, puis `kubectl apply -k` est relancé :
+
+- le contenu du ConfigMap change, donc son **hash** change, donc son **nom** : `whoami-config-6t5d5gdccm` devient `whoami-config-9mtdt796g2` ;
+- Kustomize réécrit ce nom dans `envFrom` du Deployment (`deployment.apps/whoami configured`), ce qui **modifie le template de Pod** ;
+- Kubernetes fait un rolling update : le nouveau pod devient `Running`, puis l'ancien est terminé.
+
+Dans le TP14, le ConfigMap avait un **nom fixe** : modifier ses données ne changeait pas le Deployment, donc aucun Pod n'était recréé sans `kubectl rollout restart`.
+
+Vérification : le Deployment référence `whoami-config-9mtdt796g2`, qui contient `{"LOG_LEVEL":"trace","WHOAMI_NAME":"dev"}`, et un `port-forward` sur le pod renvoie `Name: dev`. L'ancien ConfigMap reste en place, car `kubectl apply -k` ne supprime rien sans `--prune`.
+
+[![Déploiement des trois overlays](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-apply.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-apply.png)
+
+[![ConfigMap whoami-config-9mtdt796g2 utilisé par le Deployment](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-configmap-verif.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-configmap-verif.png)
+
+[![port-forward : Name: dev](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-port-forward-ok.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-port-forward-ok.png)
+
+---
+
+## 6. Partie 5 : comparaison Helm / Kustomize
+
+[#6-partie-5--comparaison-helm--kustomize](#6-partie-5--comparaison-helm--kustomize)
+
+| Critère                               | Helm                                                                              | Kustomize                                                                       |
+| ------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Mécanisme (template / patch)          | Templates Go + fichiers `values` : le YAML est généré                             | Patches et transformateurs appliqués à une base en YAML pur, sans template      |
+| Gestion des releases et rollback      | Oui : révisions stockées dans des Secrets, `history`, `rollback`, `--atomic`      | Non : pas de notion de release, le retour arrière passe par Git ou `kubectl rollout undo` |
+| Distribution d'un logiciel à des tiers | Très adapté : charts versionnés, dépôts, registres OCI, `helm install`           | Peu adapté : dossiers ou dépôts Git, sans versionnement de paquet               |
+| Lisibilité du YAML final              | Moyenne : les templates mélangent YAML et logique (`{{ }}`, `nindent`)            | Bonne : la base est du YAML valide, les overlays ne contiennent que les différences |
+| Intégré à kubectl                     | Non : binaire séparé à installer                                                  | Oui : `kubectl apply -k` et `kubectl kustomize`                                 |
+| Support par Argo CD                   | Oui, natif                                                                        | Oui, natif                                                                      |
+
+**Quand utiliser les deux ensemble ?** Pour déployer un chart tiers en l'adaptant sans le forker : on déclare le chart avec `helmCharts:` dans une `kustomization.yaml`, ou on fait `helm template` puis on applique des patches Kustomize (labels, `resources`, sidecar). Helm apporte le paquet, Kustomize la personnalisation par environnement.
+
+---
+
+## 7. Défis
+
+[#7-défis](#7-défis)
+
+### Défi 1 : `values.schema.json` (réalisé)
+
+[#défi-1--valuesschemajson-réalisé](#défi-1--valuesschemajson-réalisé)
+
+Un schéma JSON (`replicaCount` entier d'au moins 1, `containerPort` entier, `image.repository` et `image.tag` chaînes, `ingress.enabled` booléen) valide les values avant tout rendu.
+
+```
+helm lint chart-starter/whoami                                   # 0 chart(s) failed
+helm lint chart-starter/whoami --set replicaCount=trois          # at '/replicaCount': got string, want integer
+helm template test chart-starter/whoami --set replicaCount=0     # at '/replicaCount': minimum: got 0, want 1
+helm template test chart-starter/whoami --set replicaCount=2    # replicas: 2
+```
+
+Le schéma bloque donc aussi `helm template` et `helm install`, pas seulement `helm lint`.
+
+[![values.schema.json présent dans le chart](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-schema-fichiers.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-schema-fichiers.png)
+
+[![helm template refuse trois et 0](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-schema-template.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-schema-template.png)
+
+[![helm lint refuse replicaCount: "trois"](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/helm-schema.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/helm-schema.png)
+
+### Défi 2 : registre OCI Harbor (non réalisé)
+
+[#défi-2--registre-oci-harbor-non-réalisé](#défi-2--registre-oci-harbor-non-réalisé)
+
+Au moment du TP, seul le conteneur `harbor-log` tournait : les autres conteneurs Harbor (`nginx`, `core`, `registry`) étaient arrêtés, et `https://harbor.lab.local/api/v2.0/health` renvoyait `404` (c'est le Traefik de K3s qui répond sur les ports 80 et 443, pas Harbor). Le `helm push` vers `oci://harbor.lab.local/devsecops` n'a donc pas été testé. Un registre `local-registry` tourne sur le port 5000 et pourrait servir de substitut avec `--plain-http`.
+
+---
+
+## 8. Difficultés rencontrées
+
+[#8-difficultés-rencontrées-1](#8-difficultés-rencontrées-1)
+
+- **Pull d'image très lent** : les pods `podinfo` sont restés plusieurs minutes en `ContainerCreating` (événement `Pulling image` sans suite), sur une résolution DNS64 (`64:ff9b::`) de `ghcr.io`. Résolu en pré-téléchargeant l'image avec `sudo k3s crictl pull`, puis en faisant de même pour `traefik/whoami` avant les parties suivantes.
+- **`--atomic --timeout 60s`** : le rollback automatique a échoué faute de temps (release en `failed`). Réparation par `helm rollback ... --wait --timeout 120s`, puis nouvel essai réussi avec `--timeout 90s`.
+- **`kubectl exec ... -- env` impossible** : l'image `traefik/whoami` ne contient aucun binaire (`executable file not found in $PATH`). La valeur de `LOG_LEVEL` a été vérifiée avec `jsonpath` sur le Deployment et le ConfigMap, et `WHOAMI_NAME` avec un `port-forward`.
+- **Port local 8080 déjà utilisé** par un Jenkins (`address already in use`) : le `curl` interrogeait Jenkins sans que l'on s'en aperçoive. Solution : `port-forward` sur le port 18080.
+
+[![Port 8080 déjà utilisé](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-port-8080-conflit.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-port-8080-conflit.png)
+
+[![exec impossible : image sans binaire](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp15/kustomize-exec-erreur.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp15/kustomize-exec-erreur.png)
+- **Chevrons laissés dans les commandes** : `<IP>` et `<tag>` d'un énoncé sont des emplacements à remplacer, ce qui a fait échouer l'entrée `/etc/hosts` et un `crictl pull`.
+- **Fichiers de départ absents de la VM** : `chart-starter.zip` et `kustomize-starter.zip` étaient sur Windows, copiés avec `scp` avant extraction.
+- **Harbor arrêté** : voir le défi 2.
+
+---
+
+## 9. Liste des captures
+
+[#9-liste-des-captures](#9-liste-des-captures)
+
+| Fichier                   | Contenu                                                              |
+| ------------------------- | -------------------------------------------------------------------- |
+| `helm-lint-template.png`  | `helm lint` sans erreur, extrait de `helm template` et Ingress       |
+| `helm-history.png`        | `helm history` après upgrade, échec et rollback                      |
+| `helm-atomic.png`         | Upgrade `--atomic` annulé automatiquement                            |
+| `kustomize-envs.png`      | Trois Deployments (dev / staging / prod) avec des replicas différents |
+| `kustomize-diff.png`      | `diff` staging / prod                                                |
+| `helm-schema.png`         | `helm lint` refusant `replicaCount: "trois"` (défi 1)                |
+
+Captures complémentaires :
+
+| Fichier | Contenu |
+| --- | --- |
+| `helm-podinfo-pods.png` | Chart public podinfo : 2 pods `Running` |
+| `helm-atomic-historique.png` | Premier essai `--atomic` : échec à 60 s, réussite à 90 s |
+| `helm-lint.png`, `helm-dry-run-debut.png`, `helm-dry-run-fin.png` | Lint et `--dry-run=server` |
+| `helm-install-dev.png`, `helm-upgrade-rev2.png`, `helm-upgrade-rev3-echec.png` | Révisions 1 à 3 |
+| `helm-package-0.1.0.png`, `helm-package-0.1.1.png` | Archives du chart |
+| `helm-uninstall.png` | Désinstallation de la release |
+| `kustomize-apply.png`, `kustomize-configmap-verif.png`, `kustomize-port-forward-ok.png` | Déploiement et vérification du ConfigMap |
+| `kustomize-port-8080-conflit.png`, `kustomize-exec-erreur.png` | Difficultés rencontrées |
+| `helm-schema-fichiers.png`, `helm-schema-template.png` | Défi 1 : schéma et refus par `helm template` |
