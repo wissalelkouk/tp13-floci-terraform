@@ -1,0 +1,75 @@
+# TP16 partie 3 : Keycloak en mode développement (base H2 en mémoire, un seul Pod) : lab uniquement.
+# En production : opérateur Keycloak, base PostgreSQL, plusieurs instances, mode "start" optimisé.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: keycloak }
+  template:
+    metadata:
+      labels: { app: keycloak }
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.3
+          args: ["start-dev"]
+          env:
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: keycloak-admin, key: password }
+            - name: KC_HOSTNAME
+              value: https://keycloak.lab.local
+            - name: KC_PROXY_HEADERS # Keycloak est derrière Traefik, qui termine le TLS
+              value: xforwarded
+            - name: KC_HTTP_ENABLED
+              value: "true"
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /realms/master, port: http }
+            initialDelaySeconds: 20
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits: { memory: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  selector: { app: keycloak }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keycloak
+  namespace: keycloak
+  annotations:
+    cert-manager.io/cluster-issuer: lab-ca-issuer
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [keycloak.lab.local]
+      secretName: keycloak-tls
+  rules:
+    - host: keycloak.lab.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: keycloak
+                port: { name: http }

@@ -1,0 +1,57 @@
+# TP16 partie 5 : oauth2-proxy devant whoami. Seuls les utilisateurs authentifiés ET autorisés passent.
+# Le Secret oauth2-proxy (client-secret, cookie-secret) est créé en ligne de commande (voir TP.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: tp16
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: oauth2-proxy }
+  template:
+    metadata:
+      labels: { app: oauth2-proxy }
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.9.0
+          args:
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url=https://keycloak.lab.local/realms/lab
+            - --provider-ca-file=/etc/lab-ca/ca.crt # faire confiance à la CA de lab
+            - --client-id=whoami
+            - --redirect-url=https://whoami.lab.local/oauth2/callback
+            - --upstream=http://whoami.tp16.svc:80
+            - --http-address=0.0.0.0:4180
+            - --email-domain=*
+            - --code-challenge-method=S256 # PKCE
+            - --pass-access-token=true
+            - --set-xauthrequest=true
+            - --allowed-role=developer
+            - --allowed-role=admin
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: oauth2-proxy, key: client-secret } }
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom: { secretKeyRef: { name: oauth2-proxy, key: cookie-secret } }
+          ports: [{ name: http, containerPort: 4180 }]
+          volumeMounts:
+            - { name: lab-ca, mountPath: /etc/lab-ca, readOnly: true }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 64Mi }
+      volumes:
+        - name: lab-ca
+          secret:
+            secretName: lab-ca-public # copie du certificat PUBLIC de la CA (voir TP.md)
+            items: [{ key: ca.crt, path: ca.crt }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: tp16
+spec:
+  selector: { app: oauth2-proxy }
+  ports: [{ name: http, port: 80, targetPort: http }]

@@ -1442,3 +1442,181 @@ Captures complémentaires :
 | `kustomize-apply.png`, `kustomize-configmap-verif.png`, `kustomize-port-forward-ok.png` | Déploiement et vérification du ConfigMap |
 | `kustomize-port-8080-conflit.png`, `kustomize-exec-erreur.png` | Difficultés rencontrées |
 | `helm-schema-fichiers.png`, `helm-schema-template.png` | Défi 1 : schéma et refus par `helm template` |
+
+---
+
+# TP16 : HTTPS avec cert-manager et IAM avec Keycloak (OIDC)
+
+**Auteur :** Wissal **Date :** 19 novembre 2026 **Environnement :** Ubuntu Server 26.04, K3s v1.36.5+k3s1 (TP14), Helm v3.22.1, cert-manager v1.21.3, Keycloak 26.3.5, oauth2-proxy v7.9.0
+
+Sans nom de domaine public, Let's Encrypt est impossible : une **autorité de certification de lab** est créée avec cert-manager. Keycloak sert de fournisseur d'identité (OpenID Connect) et oauth2-proxy protège l'application `whoami` sans modifier son code.
+
+## Sommaire
+
+1. [Structure du rendu](#1-structure-du-rendu-tp16)
+2. [Partie 1 : cert-manager et CA de lab](#2-partie-1--cert-manager-et-ca-de-lab)
+3. [Partie 2 : Ingress HTTPS](#3-partie-2--ingress-https)
+4. [Partie 3 : déployer Keycloak](#4-partie-3--déployer-keycloak)
+5. [Partie 4 : realm, client, rôles et utilisateurs](#5-partie-4--realm-client-rôles-et-utilisateurs)
+6. [Partie 5 : oauth2-proxy](#6-partie-5--protéger-lapplication-avec-oauth2-proxy)
+7. [Défis](#7-défis-tp16)
+8. [Difficultés rencontrées](#8-difficultés-rencontrées-tp16)
+9. [Liste des captures](#9-liste-des-captures-tp16)
+
+## 1. Structure du rendu TP16
+
+Les manifests complétés sont dans `tp16/manifests/` et les captures dans `captures/tp16/`. **Aucun secret n'est versé** : ni la clé privée de la CA (`tls.key`), ni le secret du client, ni le mot de passe administrateur, ni les mots de passe des utilisateurs. Les Secrets sont créés en ligne de commande.
+
+```
+tp16/manifests/
+├── 00-app.yaml
+├── 05-coredns-custom.yaml      (IP du nœud : 172.28.79.32)
+├── 10-issuers.yaml             (ClusterIssuer ca : secretName: lab-ca)
+├── 20-ingress-tls.yaml         (bloc tls, entrée websecure, backend oauth2-proxy)
+├── 30-keycloak.yaml
+└── 40-oauth2-proxy.yaml        (--allowed-role=developer et admin)
+captures/tp16/
+```
+
+## 2. Partie 1 : cert-manager et CA de lab
+
+```
+helm repo add jetstack https://charts.jetstack.io && helm repo update
+helm install cert-manager jetstack/cert-manager -n cert-manager --create-namespace --set crds.enabled=true
+kubectl apply -f manifests/10-issuers.yaml
+kubectl get clusterissuers
+kubectl -n cert-manager get certificate lab-ca
+```
+
+Le TODO de `10-issuers.yaml` est complété : l'émetteur `lab-ca-issuer` est de type `ca` et lit le Secret `lab-ca` (`ca.secretName: lab-ca`). Deux émetteurs existent : `selfsigned` (qui sert seulement à créer la CA) et `lab-ca-issuer` (qui signe les certificats des applications).
+
+[![cert-manager : pods Running, CRD installées, release à réparer](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/cert-manager-pods.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/cert-manager-pods.png)
+
+[![Webhook cert-manager opérationnel (dry-run serveur)](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/issuers-dry-run.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/issuers-dry-run.png)
+
+[![ClusterIssuers READY True, Certificate lab-ca, dates de la CA, confiance sur la VM](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/clusterissuers.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/clusterissuers.png)
+
+La CA `Lab DevSecOps CA` est valable un an. Son **certificat public** (`ca.crt`) est exporté et installé comme autorité de confiance sur la VM (`update-ca-certificates` : `1 added`). La clé privée n'est jamais diffusée : quiconque la possède peut émettre des certificats valides pour n'importe quel nom.
+
+## 3. Partie 2 : Ingress HTTPS
+
+`20-ingress-tls.yaml` reçoit un bloc `tls` (hôte `whoami.lab.local`, Secret `whoami-tls`) et l'annotation Traefik `router.entrypoints: websecure` (HTTPS uniquement). L'annotation `cert-manager.io/cluster-issuer: lab-ca-issuer` demande à cert-manager de créer le certificat lui-même.
+
+```
+kubectl apply -f manifests/20-ingress-tls.yaml
+kubectl -n tp16 get certificate,certificaterequest
+curl -v https://whoami.lab.local
+```
+
+[![curl : certificat vérifié, émis par Lab DevSecOps CA, HTTP/2 200](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/https-curl.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/https-curl.png)
+
+[![SAN DNS:whoami.lab.local et validité de 90 jours](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/https-san.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/https-san.png)
+
+**Que fait cert-manager si on supprime le Secret `whoami-tls` ?** Il détecte l'absence du Secret (`Issuing certificate as Secret does not exist`), génère une nouvelle clé, crée un nouveau `CertificateRequest` (`whoami-tls-2`) et recrée le Secret en quelques secondes. Le renouvellement anticipé est réglé par **`spec.renewBefore`** ; vide ici, le défaut s'applique (un tiers de la durée de vie) : `renewalTime` tombe 30 jours avant l'expiration (durée par défaut de 90 jours).
+
+[![Suppression du Secret : cert-manager le recrée](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/https-secret-renew.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/https-secret-renew.png)
+
+## 4. Partie 3 : déployer Keycloak
+
+```
+kubectl create namespace keycloak
+kubectl -n keycloak create secret generic keycloak-admin --from-literal=password="$(openssl rand -base64 18)"
+kubectl apply -f manifests/05-coredns-custom.yaml
+kubectl -n kube-system rollout restart deploy/coredns
+kubectl apply -f manifests/30-keycloak.yaml
+kubectl -n keycloak rollout status deploy/keycloak
+```
+
+`05-coredns-custom.yaml` fait résoudre `*.lab.local` vers l'IP du nœud **à l'intérieur du cluster** : oauth2-proxy doit joindre Keycloak par le même nom que le navigateur, sinon l'émetteur (`iss`) des jetons ne correspond pas. Keycloak tourne en mode `start-dev` (base H2 en mémoire, un seul Pod) : lab uniquement.
+
+[![Keycloak 26.3.5 Running, Ingress, certificat keycloak-tls READY True](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-pods.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-pods.png)
+
+[![https://keycloak.lab.local répond 200 sans -k](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-curl-200.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-curl-200.png)
+
+[![Page de connexion Keycloak en HTTPS](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-login.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-login.png)
+
+## 5. Partie 4 : realm, client, rôles et utilisateurs
+
+Dans le realm **`lab`** : rôles `user`, `developer`, `admin` ; utilisateurs `alice` (admin), `bob` (developer), `carol` (user) avec email, prénom, nom, **Email verified** activé, et un mot de passe non temporaire. Le client `whoami` est **confidentiel** (flux Standard uniquement), avec l'URI de redirection `https://whoami.lab.local/oauth2/callback` et un mapper **Audience** qui place `whoami` dans le claim `aud`.
+
+[![Realm lab : rôles et utilisateurs](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-realm.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-realm.png)
+
+[![Client whoami : URI de redirection et origine web](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-client-redirect.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-client-redirect.png)
+
+[![Mapper Audience whoami-audience](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-client-mapper.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-client-mapper.png)
+
+[![Rôle direct de bob : developer](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-role-bob.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-role-bob.png)
+
+[![Rôle direct de carol : user](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-role-carol.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-role-carol.png)
+
+[![Rôle direct d'alice : admin](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-role-alice.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-role-alice.png)
+
+### Jeton JWT de `bob`
+
+Le flux password n'est utilisé ici que pour observer le jeton (**Direct access grants** activé temporairement, puis désactivé).
+
+[![Jeton décodé : iss, aud, exp, rôles](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/jwt-decoded.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/jwt-decoded.png)
+
+- `iss` : `https://keycloak.lab.local/realms/lab` (identique à l'`issuer` de la découverte OIDC) ;
+- `aud` : `whoami` (mapper Audience) et `account` ;
+- `exp` : timestamp Unix d'expiration (quelques minutes) ;
+- `preferred_username` : `bob` ; `realm_access.roles` contient `developer`.
+
+[![Découverte OIDC : issuer et endpoints](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/oidc-discovery.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/oidc-discovery.png)
+
+## 6. Partie 5 : protéger l'application avec oauth2-proxy
+
+Deux Secrets sont créés en ligne de commande (jamais dans le dépôt) : `oauth2-proxy` (secret du client, secret de cookie) et `lab-ca-public` (certificat **public** de la CA, pour que oauth2-proxy joigne Keycloak en HTTPS). Le TODO de `40-oauth2-proxy.yaml` est complété avec `--allowed-role=developer` et `--allowed-role=admin`, puis l'Ingress `whoami` pointe vers le Service `oauth2-proxy`.
+
+[![oauth2-proxy déployé avec les deux rôles autorisés](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/oauth2-deploy.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/oauth2-deploy.png)
+
+[![L'Ingress pointe vers oauth2-proxy](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/oauth2-ingress.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/oauth2-ingress.png)
+
+[![Sans session : 403, page de connexion oauth2-proxy](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/oauth2-curl-403.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/oauth2-curl-403.png)
+
+[![Page de connexion oauth2-proxy](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/oauth2-login.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/oauth2-login.png)
+
+### Accès autorisé : `bob` et `alice`
+
+[![bob (developer) et alice (admin) accèdent à whoami](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/oauth2-allowed.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/oauth2-allowed.png)
+
+L'application reçoit l'identité dans les en-têtes : `X-Forwarded-User`, `X-Forwarded-Email` (`bob@lab.local`, `alice@lab.local`), `X-Forwarded-Preferred-Username` et `X-Forwarded-Groups` (qui contient `role:developer` pour bob, `role:admin` pour alice). Ce sont les en-têtes que oauth2-proxy transmet à l'amont quand il fait office de reverse proxy ; les en-têtes `X-Auth-Request-*` de l'énoncé sont ceux de son mode `auth_request` (réponse à un sous-requête de Traefik). Le jeton d'accès (`X-Forwarded-Access-Token`) et le cookie de session sont **masqués** sur les captures.
+
+### Accès refusé : `carol`
+
+[![carol (rôle user) : 403 Forbidden](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/oauth2-403.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/oauth2-403.png)
+
+`carol` s'authentifie correctement chez Keycloak, mais n'a ni `developer` ni `admin` : oauth2-proxy journalise `[AuthFailure] Invalid authentication via OAuth2: unauthorized` pour `carol@lab.local` et renvoie 403. C'est la différence entre **authentification** (qui est-ce ?) et **autorisation** (a-t-il le droit ?).
+
+### Déconnexion et SSO
+
+`/oauth2/sign_out` supprime seulement le cookie d'oauth2-proxy, c'est-à-dire la session de l'application. La session de l'utilisateur chez Keycloak reste ouverte : au prochain accès, l'utilisateur est reconnecté sans ressaisir son mot de passe. C'est le principe du **SSO**. Pour tout fermer, il faut aussi se déconnecter de Keycloak, ou configurer une déconnexion unique (`--backend-logout-url`).
+
+## 7. Défis TP16
+
+Non réalisés : middleware Express validant le JWT (JWKS, `iss`, `aud`, `exp`) et émetteur ACME local (step-ca ou Pebble).
+
+## 8. Difficultés rencontrées TP16
+
+- **`helm install cert-manager` expiré** (`failed post-install: timed out`) : le Job `startupapicheck` avait échoué pendant le téléchargement lent des images. Les composants tournaient ; `helm upgrade --wait` a remis la release en `deployed`.
+- **Ingress du TP14 sur le même hôte** : `whoami.lab.local` renvoyait `Name: tp14-v3`. L'Ingress du TP14 a été sauvegardé puis supprimé.
+- **Image Keycloak coupée** (`connection reset by peer`, `crictl pull` sans message après `timeout`) : téléchargement avec `docker pull` puis `docker save | k3s ctr images import -` (sans fichier intermédiaire, car `/tmp` est en mémoire).
+- **Fichier hosts Windows non pris en compte** : ligne ajoutée en PowerShell administrateur, puis `ipconfig /flushdns` ; la CA est importée dans le magasin de confiance Windows.
+- **Deux realms `lab`** : un realm au nom contenant une espace (`lab%20` dans l'URL) avait été créé par erreur ; supprimé après vérification avec `jq .realm`.
+- **Jeton `null`** : `Client not allowed for direct access grants`, puis `Invalid user credentials`, puis `Account is not fully set up` : flux password à activer, mot de passe à redéfinir (**Temporary** sur Off), actions requises à vider.
+- **Emails personnels visibles** sur une capture : remplacés par `…@lab.local`.
+
+[![Deux realms : lab et un doublon mal nommé](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/keycloak-realms-doublon.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/keycloak-realms-doublon.png)
+
+[![Realm lab : 200, lab%20 : 404 après suppression](https://github.com/wissalelkouk/tp13-floci-terraform/raw/main/captures/tp16/realm-lab-verif.png)](https://github.com/wissalelkouk/tp13-floci-terraform/blob/main/captures/tp16/realm-lab-verif.png)
+
+## 9. Liste des captures TP16
+
+| Fichier | Contenu |
+| --- | --- |
+| `clusterissuers.png` | ClusterIssuers, Certificate de la CA |
+| `https-curl.png` | `curl` : certificat vérifié, émis par la CA de lab |
+| `keycloak-realm.png` | Realm `lab` : rôles et utilisateurs |
+| `jwt-decoded.png` | Jeton décodé : `iss`, `aud`, `exp`, rôles |
+| `oauth2-allowed.png` | Accès autorisé (bob et alice), jeton masqué |
+| `oauth2-403.png` | Accès refusé (carol) |

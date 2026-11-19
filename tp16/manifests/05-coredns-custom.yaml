@@ -1,0 +1,15 @@
+# TP16 : résolution des noms *.lab.local À L'INTÉRIEUR du cluster (oauth2-proxy doit joindre Keycloak
+# par le même nom que le navigateur, sinon l'émetteur des jetons ne correspond pas).
+# K3s charge automatiquement les clés *.server de ce ConfigMap dans CoreDNS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  lab.server: |
+    lab.local:53 {
+      hosts {
+        172.28.79.32 whoami.lab.local keycloak.lab.local
+      }
+    }
